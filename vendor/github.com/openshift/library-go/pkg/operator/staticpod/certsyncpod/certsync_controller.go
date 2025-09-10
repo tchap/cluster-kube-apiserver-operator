@@ -1,7 +1,9 @@
 package certsyncpod
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -115,7 +117,7 @@ func (c *CertSyncController) sync(ctx context.Context, syncCtx factory.SyncConte
 
 		contentDir := getConfigMapDir(c.destinationDir, cm.Name)
 
-		data := map[string]string{}
+		data := make(map[string]string, len(configMap.Data))
 		for filename := range configMap.Data {
 			fullFilename := filepath.Join(contentDir, filename)
 
@@ -152,27 +154,7 @@ func (c *CertSyncController) sync(ctx context.Context, syncCtx factory.SyncConte
 			continue
 		}
 
-		klog.Infof("Creating directory %q ...", contentDir)
-		if err := os.MkdirAll(contentDir, 0755); err != nil && !os.IsExist(err) {
-			c.eventRecorder.Warningf("CertificateUpdateFailed", "Failed creating directory for configmap: %s/%s: %v", configMap.Namespace, configMap.Name, err)
-			errors = append(errors, err)
-			continue
-		}
-		for filename, content := range configMap.Data {
-			fullFilename := filepath.Join(contentDir, filename)
-			// if the existing is the same, do nothing
-			if reflect.DeepEqual(data[fullFilename], content) {
-				continue
-			}
-
-			klog.Infof("Writing configmap manifest %q ...", fullFilename)
-			if err := staticpod.WriteFileAtomic([]byte(content), 0644, fullFilename); err != nil {
-				c.eventRecorder.Warningf("CertificateUpdateFailed", "Failed writing file for configmap: %s/%s: %v", configMap.Namespace, configMap.Name, err)
-				errors = append(errors, err)
-				continue
-			}
-		}
-		c.eventRecorder.Eventf("CertificateUpdated", "Wrote updated configmap: %s/%s", configMap.Namespace, configMap.Name)
+		errors = append(errors, writeFiles(&realFS, c.eventRecorder, "configmap", configMap.ObjectMeta, contentDir, data, 0644))
 	}
 
 	klog.Infof("Syncing secrets: %v", c.secrets)
@@ -220,7 +202,7 @@ func (c *CertSyncController) sync(ctx context.Context, syncCtx factory.SyncConte
 
 		contentDir := getSecretDir(c.destinationDir, s.Name)
 
-		data := map[string][]byte{}
+		data := make(map[string][]byte, len(secret.Data))
 		for filename := range secret.Data {
 			fullFilename := filepath.Join(contentDir, filename)
 
@@ -257,29 +239,104 @@ func (c *CertSyncController) sync(ctx context.Context, syncCtx factory.SyncConte
 			continue
 		}
 
-		klog.Infof("Creating directory %q ...", contentDir)
-		if err := os.MkdirAll(contentDir, 0755); err != nil && !os.IsExist(err) {
-			c.eventRecorder.Warningf("CertificateUpdateFailed", "Failed creating directory for secret: %s/%s: %v", secret.Namespace, secret.Name, err)
-			errors = append(errors, err)
-			continue
-		}
-		for filename, content := range secret.Data {
-			// TODO fix permissions
-			fullFilename := filepath.Join(contentDir, filename)
-			// if the existing is the same, do nothing
-			if reflect.DeepEqual(data[fullFilename], content) {
-				continue
-			}
+		errors = append(errors, writeFiles(&realFS, c.eventRecorder, "secret", secret.ObjectMeta, contentDir, data, 0600))
+	}
+	return utilerrors.NewAggregate(errors)
+}
 
-			klog.Infof("Writing secret manifest %q ...", fullFilename)
-			if err := staticpod.WriteFileAtomic(content, 0600, fullFilename); err != nil {
-				c.eventRecorder.Warningf("CertificateUpdateFailed", "Failed writing file for secret: %s/%s: %v", secret.Namespace, secret.Name, err)
-				errors = append(errors, err)
-				continue
-			}
-		}
-		c.eventRecorder.Eventf("CertificateUpdated", "Wrote updated secret: %s/%s", secret.Namespace, secret.Name)
+type fileSystem struct {
+	MkdirAll              func(path string, perm os.FileMode) error
+	MkdirTemp             func(dir, pattern string) (string, error)
+	RemoveAll             func(path string) error
+	WriteFile             func(name string, data []byte, perm os.FileMode) error
+	SwapDirectoriesAtomic func(dirA, dirB string) error
+	HashDirectory         func(path string) ([]byte, error)
+}
+
+var realFS = fileSystem{
+	MkdirAll:              os.MkdirAll,
+	MkdirTemp:             os.MkdirTemp,
+	RemoveAll:             os.RemoveAll,
+	WriteFile:             os.WriteFile,
+	SwapDirectoriesAtomic: staticpod.SwapDirectoriesAtomic,
+	HashDirectory:         hashDirectory,
+}
+
+func writeFiles[C string | []byte](
+	fs *fileSystem, eventRecorder events.Recorder,
+	typeName string, o metav1.ObjectMeta,
+	targetDir string, files map[string]C, filePerm os.FileMode,
+) error {
+	// We are doing to prepare a tmp directory and write all files into that directory.
+	// Then we are going to atomically swap the new data directory for the old one.
+	// This is currently implemented as really atomically exchanging directories.
+	//
+	// The same goal of atomic swap could be implemented using symlinks much like AtomicWriter does in
+	// https://github.com/kubernetes/kubernetes/blob/v1.34.0/pkg/volume/util/atomic_writer.go#L58
+	// The reason we don't do that is that we already have a directory populated and watched that needs to we swapped,
+	// in other words, it's for compatibility reasons. And if we were to migrate to the symlink approach,
+	// we would anyway need to atomically turn the current data directory to a symlink.
+	// This would all just increase complexity and require atomic swap on the OS level anyway.
+
+	// In case the target directory does not exist, create it so that the directory not existing is not a special case.
+	klog.Infof("Ensuring content directory %q exists ...", targetDir)
+	if err := fs.MkdirAll(targetDir, 0755); err != nil && !os.IsExist(err) {
+		eventRecorder.Warningf("CertificateUpdateFailed", "Failed creating content directory for %s: %s/%s: %v", typeName, o.Namespace, o.Name, err)
+		return err
 	}
 
-	return utilerrors.NewAggregate(errors)
+	// We make sure the target directory is unchanged while we prepare the switch by computing the directory hash.
+	klog.Infof("Hashing current content directory %q ...", targetDir)
+	targetDirHashBefore, err := fs.HashDirectory(targetDir)
+	if err != nil {
+		eventRecorder.Warningf("CertificateUpdateFailed", "Failed to hash current content directory for %s: %s/%s: %v", typeName, o.Namespace, o.Name, err)
+		return err
+	}
+
+	// Create a tmp source directory to be swapped.
+	klog.Infof("Creating temporary directory to swap for %q ...", targetDir)
+	tmpDir, err := fs.MkdirTemp(filepath.Dir(targetDir), filepath.Base(targetDir)+"-*")
+	if err != nil {
+		eventRecorder.Warningf("CertificateUpdateFailed", "Failed to create temporary directory for %s: %s/%s: %v", typeName, o.Namespace, o.Name, err)
+		return err
+	}
+	defer func() {
+		if err := fs.RemoveAll(tmpDir); err != nil {
+			klog.Errorf("Failed to remove temporary directory %q during cleanup: %v", tmpDir, err)
+		}
+	}()
+
+	// Populate the tmp directory with files.
+	for filename, content := range files {
+		fullFilename := filepath.Join(tmpDir, filename)
+		klog.Infof("Writing %s manifest %q ...", typeName, fullFilename)
+
+		if err := fs.WriteFile(fullFilename, []byte(content), filePerm); err != nil {
+			eventRecorder.Warningf("CertificateUpdateFailed", "Failed writing file for %s: %s/%s: %v", typeName, o.Namespace, o.Name, err)
+			return err
+		}
+	}
+
+	// Make sure the target directory hasn't changed in the meantime.
+	klog.Infof("Hashing current content directory %q again and ensuring it's unchanged ...", targetDir)
+	targetDirHashAfter, err := fs.HashDirectory(targetDir)
+	if err != nil {
+		eventRecorder.Warningf("CertificateUpdateFailed", "Failed to hash current content directory for %s: %s/%s: %v", typeName, o.Namespace, o.Name, err)
+		return err
+	}
+	if !bytes.Equal(targetDirHashBefore, targetDirHashAfter) {
+		eventRecorder.Warningf("CertificateUpdateFailed", "Content directory changed while preparing to apply an update for %s: %s/%s", typeName, o.Namespace, o.Name)
+		klog.Warningf("Content directory changed while preparing to apply an update: %q", targetDir)
+		return fmt.Errorf("content directory changed while preparing to apply an update: %q", targetDir)
+	}
+
+	// Swap directories atomically.
+	klog.Infof("Atomically swapping target directory %q with temporary directory %q for %s: %s/%s ...", targetDir, tmpDir, typeName, o.Namespace, o.Name)
+	if err := fs.SwapDirectoriesAtomic(targetDir, tmpDir); err != nil {
+		eventRecorder.Warningf("CertificateUpdateFailed", "Failed to swap target directory %q with temporary directory %q for %s: %s/%s: %v", targetDir, tmpDir, typeName, o.Namespace, o.Name, err)
+		return err
+	}
+
+	eventRecorder.Eventf("CertificateUpdated", "Wrote updated %s: %s/%s", typeName, o.Namespace, o.Name)
+	return nil
 }
